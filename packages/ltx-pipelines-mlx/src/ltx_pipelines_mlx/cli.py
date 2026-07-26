@@ -52,8 +52,8 @@ def _build_tile_count_config(args: argparse.Namespace):
 
     Returns None if both frames and spatial are 1 (no tiling).
     """
-    frames_n = getattr(args, "tile_frames", 1)
-    spatial_n = getattr(args, "tile_spatial", 1)
+    frames_n = getattr(args, "tile_frames", None) or 1
+    spatial_n = getattr(args, "tile_spatial", None) or 1
     overlap = getattr(args, "tile_overlap", 2)
     if frames_n <= 1 and spatial_n <= 1:
         return None
@@ -84,7 +84,7 @@ def _add_generation_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--tile-frames",
         type=int,
-        default=1,
+        default=None,
         help=(
             "Number of temporal tiles for modality tiling (default: 1 = no tiling). "
             "Each tile is denoised independently and blended back. Trades wall-clock "
@@ -94,7 +94,7 @@ def _add_generation_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--tile-spatial",
         type=int,
-        default=1,
+        default=None,
         help=(
             "Number of spatial tiles per axis (height and width). 2 = 2x2 = 4 spatial "
             "tiles. Combined with --tile-frames N gives N*S*S tiles total. Default: 1."
@@ -143,11 +143,36 @@ def _generate_profile_metadata(args: argparse.Namespace) -> dict[str, object]:
         mode = "two_stage"
     else:
         mode = "unspecified"
+    from ltx_pipelines_mlx.utils.performance_policy import Workload
+
+    workload = Workload(
+        height=args.height,
+        width=args.width,
+        frames=args.frames,
+        mode=mode,
+        model=args.model,
+        low_ram=args.low_ram,
+        tile_frames=args.tile_frames,
+        tile_spatial=args.tile_spatial,
+        precision=args.model_precision,
+    )
+    identity = runtime_identity()
     return {
-        **runtime_identity(),
+        **identity,
         "command": "generate",
         "mode": mode,
         "model": args.model,
+        "model_precision": workload.model_precision,
+        "model_family": workload.model_family,
+        "execution_mode": workload.execution_mode,
+        "runtime_family": getattr(args, "performance_policy", {}).get(
+            "runtime_family"
+        ),
+        "device_family": (
+            str(identity.get("device_architecture") or identity.get("device_name")).lower()
+            if identity.get("device_architecture") or identity.get("device_name")
+            else None
+        ),
         "gemma": args.gemma,
         "output": args.output,
         "height": args.height,
@@ -174,7 +199,64 @@ def _generate_profile_metadata(args: argparse.Namespace) -> dict[str, object]:
         "teacache_enabled": args.enable_teacache,
         "metal_capture_path": args.metal_capture,
         "metal_capture_phase": args.metal_capture_phase,
+        "performance_policy": getattr(args, "performance_policy", None),
     }
+
+
+def _apply_generate_performance_policy(args: argparse.Namespace) -> None:
+    """Apply explicit-overrides-first memory policy before telemetry starts."""
+    from ltx_pipelines_mlx.utils.perf_profile import runtime_identity
+    from ltx_pipelines_mlx.utils.performance_policy import Workload, decide_tiling
+
+    if args.one_stage:
+        mode = "one_stage"
+    elif args.distilled:
+        mode = "distilled"
+    elif args.two_stages_hq:
+        mode = "two_stages_hq"
+    elif args.two_stage:
+        mode = "two_stage"
+    else:
+        mode = "unspecified"
+
+    ledger_paths = list(args.performance_ledger or [])
+    env_ledgers = os.environ.get("LTX2_PERFORMANCE_LEDGER")
+    if env_ledgers:
+        ledger_paths.extend(path for path in env_ledgers.split(os.pathsep) if path)
+    if args.profile_json:
+        ledger_paths.append(args.profile_json)
+
+    workload = Workload(
+        height=args.height,
+        width=args.width,
+        frames=args.frames,
+        mode=mode,
+        model=args.model,
+        low_ram=args.low_ram,
+        precision=args.model_precision,
+    )
+    decision = decide_tiling(
+        workload,
+        runtime_identity(),
+        ledger_paths,
+        auto_enabled=args.auto_tiling,
+        explicit_tile_frames=args.tile_frames,
+        explicit_tile_spatial=args.tile_spatial,
+        tile_overlap=args.tile_overlap,
+    )
+    args.tile_frames = decision.tile_frames
+    args.tile_spatial = decision.tile_spatial
+    args.performance_policy = decision.to_metadata()
+    if decision.vae_decode_budget_gb is not None and "LTX2_VAE_DECODE_BUDGET_GB" not in os.environ:
+        os.environ["LTX2_VAE_DECODE_BUDGET_GB"] = str(decision.vae_decode_budget_gb)
+    if args.auto_tiling and not args.quiet:
+        print(
+            "Memory policy: "
+            f"{decision.decision}, predicted={decision.estimate.predicted_peak_gb:.2f} GB, "
+            f"samples={decision.estimate.sample_count}, "
+            f"confidence={decision.estimate.confidence}, "
+            f"tiles={decision.tile_frames}x{decision.tile_spatial}x{decision.tile_spatial}"
+        )
 
 
 def _validate_generate_capture_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -222,6 +304,34 @@ examples:
     # --- generate (T2V / I2V / two-stage / HQ) ---
     gen = sub.add_parser("generate", help="Generate video from text (T2V) or image (I2V)")
     _add_generation_args(gen)
+    gen.add_argument(
+        "--auto-tiling",
+        action="store_true",
+        help=(
+            "Opt in to evidence-calibrated modality/VAE tiling. Disabled by default "
+            "until fixed-seed quality qualification is complete. Explicit --tile-* "
+            "values always win."
+        ),
+    )
+    gen.add_argument(
+        "--performance-ledger",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Read prior profiling JSONL as memory-estimator evidence (repeatable). "
+            "--profile-json is also read as a self-calibrating ledger when it exists."
+        ),
+    )
+    gen.add_argument(
+        "--model-precision",
+        choices=("bf16", "q8", "q4", "unknown"),
+        default=None,
+        help=(
+            "Declare checkpoint precision for strict calibration matching. Quantized "
+            "suffixes are inferred; ambiguous paths default to unknown."
+        ),
+    )
     from ltx_pipelines_mlx.utils.args import ImageAction as _ImageAction
 
     gen.add_argument(
@@ -720,6 +830,7 @@ examples:
 
     if args.command == "generate":
         _validate_generate_capture_args(parser, args)
+        _apply_generate_performance_policy(args)
 
     # Resolve seed=-1 to a random value
     if hasattr(args, "seed") and args.seed < 0:

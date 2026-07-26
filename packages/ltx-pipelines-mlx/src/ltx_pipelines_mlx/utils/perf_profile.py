@@ -115,6 +115,16 @@ def _mlx_memory_snapshot() -> dict[str, float | str | None]:
         }
 
 
+def _reset_mlx_peak_memory() -> None:
+    """Reset MLX's process peak so each profiled run owns its peak evidence."""
+    try:
+        import mlx.core as mx
+
+        mx.reset_peak_memory()
+    except Exception:  # pragma: no cover - unsupported MLX runtime
+        pass
+
+
 @lru_cache(maxsize=1)
 def runtime_identity() -> dict[str, object]:
     """Return package, MLX, device, and source revision identity."""
@@ -187,6 +197,7 @@ class _JsonlProfiler:
         self.started = time.perf_counter()
         self._stream: TextIO | None = None
         self._observed_peak_mlx_gb = 0.0
+        self._observed_peak_process_rss_gb = 0.0
         self._observed_peak_phys_footprint_gb = 0.0
 
     def open(self) -> None:
@@ -211,6 +222,12 @@ class _JsonlProfiler:
                 self._observed_peak_mlx_gb,
                 float(mlx_peak),
             )
+        process_rss = memory.get("process_rss_gb")
+        if isinstance(process_rss, (float, int)):
+            self._observed_peak_process_rss_gb = max(
+                self._observed_peak_process_rss_gb,
+                float(process_rss),
+            )
         footprint_peak = memory.get(
             "process_lifetime_max_phys_footprint_gb"
         )
@@ -223,6 +240,10 @@ class _JsonlProfiler:
             fields.setdefault(
                 "observed_peak_mlx_gb",
                 self._observed_peak_mlx_gb,
+            )
+            fields.setdefault(
+                "observed_peak_process_rss_gb",
+                self._observed_peak_process_rss_gb or None,
             )
             fields.setdefault(
                 "observed_peak_phys_footprint_gb",
@@ -285,6 +306,7 @@ def profile_run(path: str | Path, *, metadata: Mapping[str, object]) -> Iterator
     """Append a fully flushed JSONL event stream for one generation run."""
     profiler = _JsonlProfiler(path)
     profiler.open()
+    _reset_mlx_peak_memory()
     previous_sink = _set_profile_sink(profiler.emit)
     try:
         profiler.emit(
